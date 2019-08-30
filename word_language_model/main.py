@@ -46,9 +46,14 @@ parser.add_argument('--save', type=str, default='model.pt',
                     help='path to save the final model')
 parser.add_argument('--onnx-export', type=str, default='',
                     help='path to export the final model in onnx format')
-
 parser.add_argument('--nhead', type=int, default=2,
                     help='the number of heads in the encoder/decoder of the transformer model')
+parser.add_argument('--sgd', action='store_true',
+                    help='use stochastic gradient descent')
+parser.add_argument('--lr_decay', type=float, default=1,
+                    help='Learning rate decay per epoch (1 = no decay)')
+parser.add_argument('--lr_anneal', type=float, default=1,
+                    help='Learning rate decay if no improvement (1 = no decay)')
 
 args = parser.parse_args()
 
@@ -101,7 +106,8 @@ if args.model == 'Transformer':
     model = model.TransformerModel(ntokens, args.emsize, args.nhead, args.nhid, args.nlayers, args.dropout).to(device)
 else:
     model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.tied).to(device)
-
+    if args.sgd:
+        optimizer = optim.SGD(model.parameters(), lr=args.lr)
 criterion = nn.CrossEntropyLoss()
 
 ###############################################################################
@@ -166,7 +172,10 @@ def train():
         data, targets = get_batch(train_data, i)
         # Starting each batch, we detach the hidden state from how it was previously produced.
         # If we didn't, the model would try backpropagating all the way to start of the dataset.
-        model.zero_grad()
+        if args.sgd:
+            optimizer.zero_grad()
+        else:
+            model.zero_grad()
         if args.model == 'Transformer':
             output = model(data)
         else:
@@ -174,12 +183,14 @@ def train():
             output, hidden = model(data, hidden)
         loss = criterion(output.view(-1, ntokens), targets)
         loss.backward()
-
+        
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-        for p in model.parameters():
-            p.data.add_(-lr, p.grad.data)
-
+        if args.sgd:
+            optimizer.step()
+        else:
+            model.step()
+        
         total_loss += loss.item()
 
         if batch % args.log_interval == 0 and batch > 0:
@@ -202,8 +213,15 @@ def export_onnx(path, batch_size, seq_len):
     torch.onnx.export(model, (dummy_input, hidden), path)
 
 
+def change_learning_rate(optimizer, new_lr): # NOTE: This is not currently used but is the new way of updating the learning rate
+    """Change learning rate in the model"""
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = new_lr
+
 # Loop over epochs.
 lr = args.lr
+lr_decay = args.lr_decay
+lr_anneal = args.lr_anneal
 best_val_loss = None
 
 # At any point you can hit Ctrl + C to break out of training early.
@@ -222,9 +240,20 @@ try:
             with open(args.save, 'wb') as f:
                 torch.save(model, f)
             best_val_loss = val_loss
-        else:
-            # Anneal the learning rate if no improvement has been seen in the validation dataset.
-            lr /= 4.0
+        elif lr_anneal != 1:
+            # Anneal/Decay the learning rate if no improvement has been seen in the validation dataset.
+            new_lr *= lr_anneal
+
+        if lr_decay != 1:
+            # Decay the learning rate every epoch.
+            new_lr *= args.lr_decay
+
+        if lr != new_lr:
+            # Update learning rate
+            change_learning_rate(optimizer, new_lr)
+            lr = new_lr
+
+
 except KeyboardInterrupt:
     print('-' * 89)
     print('Exiting from training early')
